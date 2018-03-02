@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package distcachepb;
+
+service Cache {
+	rpc Trxn(Request) returns (Response) {}
+}
+
+enum Status {
+	Err = 0;
+	Ok = 1;
+}
+
+enum TrxnType {
+	GET = 0;
+	SET = 1;
+	DELETE = 2;
+}
+
+message Request {
+	TrxnType type = 1;
+	string key = 2;
+	string value = 3;
+}
+
+message Response {
+	Status status = 1;
+	string server = 2;
+	string key = 3;
+	string value = 4;
+}
+
+// vim: noexpandtab sw=2 ts=2
