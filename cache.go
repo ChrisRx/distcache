@@ -1,33 +1,35 @@
 package distcache
 
 import (
-	"fmt"
-	"reflect"
+	"container/list"
 	"sync"
 	"time"
-
-	"github.com/golang/groupcache/lru"
 )
 
 type entry struct {
 	key, value string
-	expires    time.Time
+	expires    int64
+}
+
+func (e *entry) Len() int {
+	return len(e.key) + len(e.value) + 8
 }
 
 type cache struct {
-	mu  sync.RWMutex
-	lru *lru.Cache
+	mu    sync.RWMutex
+	list  *list.List
+	items map[string]*list.Element
 
 	nBytes int64
+
+	MaxCacheBytes int64
 }
 
 func newCache() *cache {
-	c := &cache{}
-	c.lru = &lru.Cache{
-		OnEvicted: func(key lru.Key, value interface{}) {
-			val := value.(string)
-			c.nBytes -= int64(len(key.(string))) + int64(len(val))
-		},
+	c := &cache{
+		list:          list.New(),
+		items:         make(map[string]*list.Element),
+		MaxCacheBytes: 1 << 28,
 	}
 	return c
 }
@@ -35,38 +37,72 @@ func newCache() *cache {
 func (c *cache) Get(key string) (val string, ok bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	value, ok := c.lru.Get(key)
-	if !ok {
-		return
+	if item, hit := c.items[key]; hit {
+		c.list.MoveToFront(item)
+		kv := item.Value.(*entry)
+		if kv.expires != 0 && kv.expires > time.Now().Unix() {
+			return
+		}
+		return kv.value, true
 	}
-	v, ok := value.(*entry)
-	if !ok {
-		panic(fmt.Errorf("expected type entry, received: %s", reflect.TypeOf(value)))
-	}
-	if !v.expires.IsZero() && time.Now().UTC().After(v.expires) {
-		return
-	}
-	return v.value, ok
+	return
 }
 
 func (c *cache) Set(key, value string) {
 	c.mu.Lock()
-	c.lru.Add(key, &entry{key: key, value: value})
-	c.nBytes += int64(len(key)) + int64(len(value))
+	c.setEntry(&entry{key: key, value: value})
 	c.mu.Unlock()
 }
 
-func (c *cache) SetTTL(key, value string, ttl time.Duration) {
+func (c *cache) SetTTL(key, value string, ttl int64) {
 	c.mu.Lock()
-	c.lru.Add(key, &entry{
-		key:     key,
-		value:   value,
-		expires: time.Now().UTC().Add(ttl),
-	})
-	c.nBytes += int64(len(key)) + int64(len(value))
+	now := time.Now().Unix()
+	c.setEntry(&entry{key, value, now + ttl})
 	c.mu.Unlock()
+}
+
+func (c *cache) setEntry(e *entry) {
+	if item, ok := c.items[e.key]; ok {
+		c.list.MoveToFront(item)
+		kv := item.Value.(*entry)
+		c.nBytes += int64(e.Len() - kv.Len())
+		kv.value = e.value
+		kv.expires = e.expires
+	}
+	c.items[e.key] = c.list.PushFront(e)
+	c.nBytes += int64(e.Len())
+	for {
+		if c.nBytes <= c.MaxCacheBytes {
+			return
+		}
+		if item := c.list.Back(); item != nil {
+			c.removeElement(item)
+		}
+	}
+
 }
 
 func (c *cache) Delete(key string) {
-	c.lru.Remove(key)
+	if item, ok := c.items[key]; ok {
+		c.removeElement(item)
+	}
+}
+
+func (c *cache) removeElement(e *list.Element) {
+	c.list.Remove(e)
+	kv := e.Value.(*entry)
+	delete(c.items, kv.key)
+	c.nBytes -= int64(kv.Len())
+}
+
+func (c *cache) Keys() []string {
+	keys := make([]string, 0)
+	for k, v := range c.items {
+		kv := v.Value.(*entry)
+		if kv.expires != 0 && kv.expires > time.Now().Unix() {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	return keys
 }
